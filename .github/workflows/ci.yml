@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint-y-tests:
+    runs-on: ubuntu-latest
+
+    # Postgres real para que los tests de integración no se salten en CI.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: jobs
+          POSTGRES_USER: jobs
+          POSTGRES_PASSWORD: jobs
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U jobs"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: jobs
+      POSTGRES_USER: jobs
+      POSTGRES_PASSWORD: jobs
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: uv sync --frozen
+
+      - name: Lint
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+
+      - name: Tests (unitarios + integración)
+        run: uv run pytest -v
