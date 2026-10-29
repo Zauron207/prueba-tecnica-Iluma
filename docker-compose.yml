@@ -1,0 +1,35 @@
+services:
+  db:
+    image: postgres:17-alpine
+    env_file: .env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  pipeline:
+    build: .
+    env_file: .env
+    environment:
+      # Dentro de la red de compose la base se llama "db", no localhost.
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      CSV_PATH: /app/data/data_jobs.csv
+    volumes:
+      - ./data:/app/data:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    profiles: ["pipeline"]
+
+volumes:
+  pgdata:
