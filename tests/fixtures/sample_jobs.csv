@@ -1,0 +1,9 @@
+job_title_short,job_title,job_location,job_via,job_schedule_type,job_work_from_home,search_location,job_posted_date,job_no_degree_mention,job_health_insurance,job_country,salary_rate,salary_year_avg,salary_hour_avg,company_name,job_skills,job_type_skills
+Data Engineer,Data Engineer,"Bogotá, Colombia",via LinkedIn,Full-time,False,Colombia,2023-03-01 10:00:00,False,True,Colombia,year,120000.0,,BNP Paribas,"['python', 'sql', 'sas', 'sas']","{'analyst_tools': ['sas'], 'programming': ['python', 'sql', 'sas']}"
+Data Engineer,Data Engineer,"Bogotá, Colombia",via LinkedIn,Full-time,False,Colombia,2023-03-01 10:00:00,False,True,Colombia,year,120000.0,,BNP Paribas,"['python', 'sql', 'sas', 'sas']","{'analyst_tools': ['sas'], 'programming': ['python', 'sql', 'sas']}"
+Data Engineer,Data Engineer,"Bogotá, Colombia",via LinkedIn,Full-time,False,Colombia,2023-03-15 10:00:00,False,True,Colombia,year,120000.0,,BNP Paribas,"['python', 'sql', 'sas', 'sas']","{'analyst_tools': ['sas'], 'programming': ['python', 'sql', 'sas']}"
+Data Analyst,Data Analyst,Anywhere,melalui LinkedIn,Full-time and Part-time,True,Sierra Leone,2023-05-10 08:30:00,True,False,,hour,,25.499999,BNP PARIBAS,['excel'],{'analyst_tools': ['excel']}
+Data Scientist,Data Scientist,"Colorado Springs, CO   (+3 others)",via Indeed,"Full-time, Contractor, and Temp work",False,"Colorado, United States",2023-07-20 12:00:00,False,False,United States,month,,,Acme Corp,,
+Data Engineer,,,via Jobs In France,,False,Saint Lucia,2023-12-14 07:32:05,False,False,,,,,,,
+Senior Data Engineer,Data  Engineer SR,"Atlanta, GA",via ZipRecruiter,Pekerjaan tetap,False,Georgia,2023-08-01 09:00:00,False,True,United States,,,,Acme Corp,"['aws', 'mongodb', 'mongodb']","{'cloud': ['aws'], 'databases': ['mongodb'], 'programming': ['mongodb']}"
+Data Engineer,Data Engineer SR,"Atlanta, GA",via ZipRecruiter,Full-time,False,Georgia,2023-08-02 09:00:00,False,False,United States,,,,acme corp,['aws'],{'cloud': ['aws']}
