@@ -1,0 +1,105 @@
+// Modelo 3FN (schema core). Pegar en https://dbdiagram.io para ver el diagrama.
+
+Project data_jobs {
+  database_type: 'PostgreSQL'
+  Note: 'Fuente única de verdad de ofertas de empleo. DDL completo en sql/schema.sql'
+}
+
+Table core.countries {
+  country_id smallint [pk, increment]
+  country_name text [not null, unique]
+}
+
+Table core.search_locations {
+  search_location_id smallint [pk, increment]
+  search_location_name text [not null, unique]
+  country_id smallint [not null, ref: > core.countries.country_id]
+  Note: 'El país depende de la búsqueda del bot, no de la ubicación de la oferta'
+}
+
+Table core.locations {
+  location_id integer [pk, increment]
+  location_name text [not null, unique]
+}
+
+Table core.companies {
+  company_id integer [pk, increment]
+  company_key text [not null, unique, note: 'nombre normalizado (identidad)']
+  company_name text [not null, note: 'variante más frecuente (para mostrar)']
+}
+
+Table core.platforms {
+  platform_id smallint [pk, increment]
+  platform_name text [not null, unique]
+}
+
+Table core.job_roles {
+  role_id smallint [pk, increment]
+  role_name text [not null, unique, note: 'job_title_short']
+}
+
+Table core.job_titles {
+  job_title_id integer [pk, increment]
+  job_title text [not null, unique]
+  role_id smallint [not null, ref: > core.job_roles.role_id]
+}
+
+Table core.schedule_types {
+  schedule_type_id smallint [pk, increment]
+  schedule_type_name text [not null, unique]
+}
+
+Table core.skill_types {
+  skill_type_id smallint [pk, increment]
+  skill_type_name text [not null, unique]
+}
+
+Table core.skills {
+  skill_id integer [pk, increment]
+  skill_name text [not null, unique]
+}
+
+Table core.skill_type_assignments {
+  skill_id integer [ref: > core.skills.skill_id]
+  skill_type_id smallint [ref: > core.skill_types.skill_type_id]
+  indexes {
+    (skill_id, skill_type_id) [pk]
+  }
+}
+
+Table core.jobs {
+  job_id bigint [pk, increment]
+  source_row_id bigint [not null, unique, note: 'linaje con raw.job_postings']
+  job_title_id integer [not null, ref: > core.job_titles.job_title_id]
+  company_id integer [ref: > core.companies.company_id]
+  location_id integer [ref: > core.locations.location_id]
+  search_location_id smallint [not null, ref: > core.search_locations.search_location_id]
+  platform_id smallint [ref: > core.platforms.platform_id]
+  posted_at timestamp [not null]
+  work_from_home boolean [not null]
+  no_degree_mention boolean [not null]
+  health_insurance boolean [not null]
+}
+
+Table core.job_schedule_types {
+  job_id bigint [ref: > core.jobs.job_id]
+  schedule_type_id smallint [ref: > core.schedule_types.schedule_type_id]
+  indexes {
+    (job_id, schedule_type_id) [pk]
+  }
+}
+
+Table core.job_skills {
+  job_id bigint [ref: > core.jobs.job_id]
+  skill_id integer [ref: > core.skills.skill_id]
+  indexes {
+    (job_id, skill_id) [pk]
+  }
+}
+
+Table core.job_salaries {
+  job_id bigint [pk, ref: - core.jobs.job_id]
+  salary_rate text [not null, note: 'year | month | week | day | hour']
+  salary_year_avg numeric(12,2)
+  salary_hour_avg numeric(10,2)
+}
