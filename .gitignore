@@ -1,0 +1,13 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# Notas personales, no forman parte de la entrega.
+notas/
+
+# El dataset pesa ~220 MB; se descarga aparte (ver README).
+data/*
+!data/.gitkeep
