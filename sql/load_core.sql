@@ -1,6 +1,7 @@
 -- Carga staging -> core (full refresh).
 -- Se ejecuta dentro de una sola transacción desde Python: si algo falla, core
--- queda exactamente como estaba antes de la corrida.
+-- queda exactamente como estaba antes de la corrida. Python quita las FK antes
+-- de este script y las recrea (validándolas) después; ver load_core.py.
 --
 -- Orden: primero catálogos, luego jobs, luego tablas puente. Las claves se
 -- resuelven por la clave natural de cada catálogo (nombre), así que los UNIQUE
@@ -93,6 +94,11 @@ CROSS JOIN LATERAL jsonb_array_elements_text(t.skill_list) AS e (skill_name)
 JOIN core.skills sk      ON sk.skill_name = e.skill_name
 JOIN core.skill_types st ON st.skill_type_name = t.skill_type_name;
 
+-- Las tablas recién cargadas no tienen estadísticas; sin ellas el planner arma
+-- los joins siguientes a ciegas.
+ANALYZE core.job_titles, core.companies, core.locations, core.platforms,
+        core.search_locations, core.skills, core.schedule_types;
+
 -- Ofertas --------------------------------------------------------------------
 
 INSERT INTO core.jobs (
@@ -117,6 +123,8 @@ LEFT JOIN core.companies co        ON co.company_key = s.company_key
 LEFT JOIN core.locations l         ON l.location_name = s.location_name
 LEFT JOIN core.platforms p         ON p.platform_name = s.platform_name
 ORDER BY s.source_row_id;
+
+ANALYZE core.jobs;
 
 -- Tablas puente y salario ------------------------------------------------------
 -- Sin DISTINCT a propósito: staging ya viene deduplicado y si no lo estuviera

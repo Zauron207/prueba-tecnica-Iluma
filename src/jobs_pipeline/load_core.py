@@ -72,8 +72,49 @@ def load_core(conn: psycopg.Connection) -> None:
     # DDL + carga en una sola transacción: o queda todo nuevo o todo como estaba.
     with conn.transaction():
         run_sql_file(conn, SQL_DIR / "schema.sql")
+        foreign_keys = _core_foreign_keys(conn)
+        _drop_foreign_keys(conn, foreign_keys)
         run_sql_file(conn, SQL_DIR / "load_core.sql")
+        _restore_foreign_keys(conn, foreign_keys)
     log_table_counts(conn)
+
+
+# Con las FK activas, cada fila insertada dispara un trigger por FK: medido con
+# EXPLAIN ANALYZE, 109 de los 128 s del INSERT en core.jobs eran esos triggers.
+# Igual que pg_restore, se cargan los datos sin FK y se recrean al final; al
+# recrearlas Postgres valida todas las filas de una vez con un solo join. Las
+# definiciones se leen del catálogo para que schema.sql siga siendo la única
+# fuente del DDL.
+def _core_foreign_keys(conn: psycopg.Connection) -> list[tuple[str, str, str]]:
+    return conn.execute(
+        """
+        SELECT conrelid::regclass::text, conname, pg_get_constraintdef(oid)
+        FROM pg_constraint
+        WHERE contype = 'f' AND connamespace = 'core'::regnamespace
+        ORDER BY 1, 2
+        """
+    ).fetchall()
+
+
+def _drop_foreign_keys(conn: psycopg.Connection, foreign_keys: list[tuple[str, str, str]]) -> None:
+    for table, name, _ in foreign_keys:
+        conn.execute(
+            sql.SQL("ALTER TABLE {} DROP CONSTRAINT {}").format(
+                sql.Identifier(*table.split(".")), sql.Identifier(name)
+            )
+        )
+
+
+def _restore_foreign_keys(
+    conn: psycopg.Connection, foreign_keys: list[tuple[str, str, str]]
+) -> None:
+    for table, name, definition in foreign_keys:
+        conn.execute(
+            sql.SQL("ALTER TABLE {} ADD CONSTRAINT {} {}").format(
+                sql.Identifier(*table.split(".")), sql.Identifier(name), sql.SQL(definition)
+            )
+        )
+    log.info("%s claves foráneas recreadas y validadas", len(foreign_keys))
 
 
 def log_table_counts(conn: psycopg.Connection) -> None:

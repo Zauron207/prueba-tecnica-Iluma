@@ -136,4 +136,7 @@ def load_staging(conn: psycopg.Connection, staging: pd.DataFrame, rejected: pd.D
             ["source_row_id", "reason"],
             iter_copy_rows(rejected, ["source_row_id", "reason"]),
         )
+        # Tabla recién llenada = sin estadísticas. Sin esto el planner arma los
+        # joins de load_core.sql a ciegas hasta que pase el autovacuum.
+        conn.execute("ANALYZE staging.job_postings")
     log.info("staging.job_postings y staging.rejected_postings cargadas")
