@@ -9,6 +9,8 @@ jobs:
     runs-on: ubuntu-latest
 
     # Postgres real para que los tests de integración no se salten en CI.
+    # Las credenciales de abajo son de una base desechable que solo existe
+    # mientras corre el job; no protegen nada, por eso no van en secrets.
     services:
       postgres:
         image: postgres:17-alpine

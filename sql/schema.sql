@@ -1,6 +1,6 @@
 -- Modelo relacional en 3FN (schema core).
--- Es la "fuente única de verdad": cada hecho se guarda en un solo lugar.
--- Las decisiones de diseño están explicadas en el README (sección "Modelo 3FN").
+-- Cada hecho se guarda en un solo lugar. Los comentarios de cada tabla dicen
+-- por qué existe; el razonamiento completo, con los números, está en el README.
 
 CREATE SCHEMA IF NOT EXISTS core;
 

@@ -3,7 +3,7 @@ from decimal import Decimal
 import pytest
 
 from jobs_pipeline.extract import read_source_csv
-from jobs_pipeline.stage import build_staging
+from jobs_pipeline.stage import _round_money, build_staging
 from jobs_pipeline.validation import validate_staging
 
 
@@ -72,7 +72,5 @@ def test_staging_cumple_contrato(staged):
 
 def test_redondeo_conserva_decimal():
     # Desde Postgres los NUMERIC llegan como Decimal; el redondeo no debe pasarlos a float.
-    from jobs_pipeline.stage import _round_money
-
     assert _round_money(Decimal("61.159996")) == Decimal("61.16")
     assert _round_money(None) is None

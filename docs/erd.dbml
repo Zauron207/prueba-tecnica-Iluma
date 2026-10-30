@@ -1,8 +1,6 @@
-// Modelo 3FN (schema core). Pegar en https://dbdiagram.io para ver el diagrama.
-
 Project data_jobs {
   database_type: 'PostgreSQL'
-  Note: 'Fuente única de verdad de ofertas de empleo. DDL completo en sql/schema.sql'
+  Note: 'Schema core del pipeline. El DDL real (con CHECKs e índices) está en sql/schema.sql'
 }
 
 Table core.countries {
