@@ -1,71 +1,60 @@
-# Pipeline de ofertas de empleo: CSV → PostgreSQL en 3FN
+# Pipeline de ofertas de empleo: de CSV a un modelo 3FN en PostgreSQL
 
-Pipeline que toma `data_jobs.csv` (785.741 ofertas de empleo de 2023 scrapeadas de Google Jobs) y lo convierte en un modelo relacional normalizado en PostgreSQL, pensado para ser la fuente única de verdad de análisis posteriores.
+Este repositorio es mi solución a la prueba técnica de Data Engineer. El pipeline toma `data_jobs.csv` (785.741 ofertas de empleo de 2023 scrapeadas de Google Jobs), lo carga en PostgreSQL y lo transforma en un modelo relacional en tercera forma normal que pueda servir como fuente de verdad para análisis posteriores.
 
-- **Stack:** Python 3.12, pandas, Pandera, psycopg 3, PostgreSQL 17, Docker Compose, uv, pytest, ruff, GitHub Actions.
-- **Entregables:** DDL del modelo en [`sql/schema.sql`](sql/schema.sql) y diagrama en [`docs/erd.dbml`](docs/erd.dbml) (también abajo en Mermaid).
+En corto, lo que hay aquí:
 
-## Contenido
+- Un pipeline en Python + SQL con tres capas (`raw`, `staging`, `core`) que corre completo en unos 4 minutos.
+- El modelo en [`sql/schema.sql`](sql/schema.sql) (15 tablas) y su diagrama en [`docs/erd.dbml`](docs/erd.dbml) y más abajo.
+- Validación de datos con Pandera, chequeos de calidad después de cargar, 93 tests con pytest y CI en GitHub Actions.
+- Postgres y el pipeline en Docker Compose; dependencias con uv.
 
-1. [Cómo ejecutarlo](#cómo-ejecutarlo)
-2. [Arquitectura](#arquitectura)
-3. [Lo que encontré en los datos](#lo-que-encontré-en-los-datos)
-4. [Modelo 3FN y decisiones de diseño](#modelo-3fn-y-decisiones-de-diseño)
-5. [Por qué estas herramientas](#por-qué-estas-herramientas)
-6. [Calidad de datos y tests](#calidad-de-datos-y-tests)
-7. [Limitaciones y qué haría con más tiempo](#limitaciones-y-qué-haría-con-más-tiempo)
-8. [Bonus: orquestación y CI/CD](#bonus-orquestación-y-cicd)
-9. [Bonus: diseño de un modelo estrella (OLAP)](#bonus-diseño-de-un-modelo-estrella-olap)
+La sección que más me importa es la de [decisiones del modelo](#el-modelo-3fn), porque casi todas salieron de mirar los datos y no del diccionario.
 
 ---
 
-## Cómo ejecutarlo
+## Cómo correrlo
 
-### Requisitos
-
-- Docker Desktop (o Docker Engine + Compose v2).
-- El archivo `data_jobs.csv` (no se versiona porque pesa ~220 MB). Hay que copiarlo a `data/data_jobs.csv`.
-- Opcional, para correr fuera de Docker: [uv](https://docs.astral.sh/uv/) y Python ≥ 3.11.
-
-### Opción A: todo en Docker
+Necesitas Docker (Docker Desktop en Windows/Mac) y el archivo `data_jobs.csv`, que no está en el repo porque pesa ~220 MB. Cópialo en `data/data_jobs.csv`.
 
 ```bash
-cp .env.example .env          # y cambiar la contraseña
-docker compose up -d db       # levanta PostgreSQL y espera el healthcheck
-docker compose --profile pipeline run --rm pipeline
+cp .env.example .env                                   # cambia la contraseña si quieres
+docker compose up -d db                                # Postgres; espera a que el healthcheck pase
+docker compose --profile pipeline run --rm pipeline    # corre el pipeline completo
 ```
 
-El servicio `pipeline` está bajo un *profile* para que `docker compose up` no lo dispare solo: la base queda arriba y el pipeline se corre cuando uno quiere.
+El servicio `pipeline` está detrás de un *profile* a propósito: así `docker compose up` solo levanta la base y el pipeline se corre cuando uno quiere, como un comando.
 
-Para correr un solo paso:
+Se puede correr un solo paso con `--step`:
 
 ```bash
-docker compose --profile pipeline run --rm pipeline --step stage
+docker compose --profile pipeline run --rm pipeline --step core   # extract | stage | core | all
 ```
 
-### Opción B: Python local + Postgres en Docker
+Si prefieres correrlo fuera de Docker (con la base igual en Docker), necesitas [uv](https://docs.astral.sh/uv/) y Python 3.11 o superior:
 
 ```bash
-cp .env.example .env
 docker compose up -d db
 uv sync
-uv run jobs-pipeline                 # o: uv run jobs-pipeline --step core
+uv run jobs-pipeline
 ```
 
-Sin uv también funciona con `pip install -r requirements.txt`.
+Sin uv también funciona con `pip install -r requirements.txt` y `python -m jobs_pipeline.pipeline`.
 
-### Consultar el resultado
+Si el puerto 5432 ya está ocupado por otro Postgres, cambia `POSTGRES_PORT` en el `.env`.
+
+Para mirar el resultado:
 
 ```bash
 docker compose exec db psql -U jobs -d jobs
 ```
 
 ```sql
--- Top 10 skills pedidos para Data Engineer
+-- Los 10 skills más pedidos para Data Engineer
 SELECT sk.skill_name, count(*) AS ofertas
 FROM core.jobs j
-JOIN core.job_titles t ON t.job_title_id = j.job_title_id
-JOIN core.job_roles r  ON r.role_id = t.role_id
+JOIN core.job_titles t  ON t.job_title_id = j.job_title_id
+JOIN core.job_roles r   ON r.role_id = t.role_id
 JOIN core.job_skills js ON js.job_id = j.job_id
 JOIN core.skills sk     ON sk.skill_id = js.skill_id
 WHERE r.role_name = 'Data Engineer'
@@ -76,33 +65,47 @@ LIMIT 10;
 
 ---
 
+## Cómo lo abordé
+
+No empecé por el modelo. Lo primero fue leer el archivo completo con pandas y perfilar cada columna: nulos, valores distintos, los valores más frecuentes y, sobre todo, buscar cosas que no cuadraran. Esa primera pasada cambió bastante lo que tenía en mente. Por ejemplo, yo daba por hecho que el país se podía colgar de la ubicación, y los datos dicen que no (más abajo explico por qué).
+
+Con el perfilado en la mano decidí tres cosas antes de escribir código:
+
+1. Guardar primero el CSV tal cual, solo tipado, para poder reprocesar sin volver al archivo.
+2. Hacer la limpieza en Python, donde la puedo probar con tests unitarios.
+3. Hacer la normalización final en SQL, que es donde los joins y las cargas por conjuntos son naturales.
+
+Después hubo dos correcciones importantes que vale la pena contar porque no salieron bien a la primera: una sobre los títulos de las ofertas y otra de rendimiento. Están en sus secciones.
+
+---
+
 ## Arquitectura
 
 ```
 data_jobs.csv
-     │  extract.py   lee, tipa, valida (Pandera) y carga con COPY
+     │  extract.py      lee, tipa, valida con Pandera y carga con COPY
      ▼
-raw.job_postings            copia fiel del CSV con tipos reales (TEXT[], JSONB, BOOLEAN, TIMESTAMP)
-     │  stage.py     limpia, estandariza, deduplica, separa rechazos, valida
+raw.job_postings         el CSV tal cual, con tipos reales (TEXT[], JSONB, BOOLEAN, TIMESTAMP)
+     │  stage.py        limpia, estandariza, deduplica, separa rechazos, valida
      ▼
-staging.job_postings        una fila por oferta, limpia pero aún desnormalizada
+staging.job_postings     una fila por oferta, limpia pero todavía desnormalizada
 staging.rejected_postings   lo que no pasó, con el motivo
-     │  load_core.sql  carga set-based en una transacción + chequeos de calidad
+     │  load_core.sql   carga por conjuntos en una transacción + chequeos de calidad
      ▼
-core.*                      modelo 3FN (15 tablas)
+core.*                   modelo 3FN (15 tablas)
 ```
 
-Separé el proceso en tres capas por razones concretas:
+**raw** no limpia nada. Su trabajo es dejar el dato con tipos correctos y un `source_row_id` (el número de fila del CSV) que viaja hasta `core.jobs`. Si alguien duda de un valor del modelo, ese id lleva a la fila original. Y si cambia una regla de limpieza, se reprocesa desde aquí.
 
-- **raw** guarda el dato tal como vino, solo tipado. Si mañana cambia una regla de limpieza, reproceso desde aquí sin volver a leer el archivo, y si alguien duda de un valor en `core`, `source_row_id` lo lleva directo a la fila original.
-- **staging** es donde vive la limpieza en Python. Es `UNLOGGED` porque es transitoria y se recrea en cada corrida: no tiene sentido pagar el costo del WAL.
-- **core** se carga con SQL puro. Python es bueno limpiando strings y probándose con pytest; Postgres es mejor resolviendo claves y cargando por conjuntos. Cada uno hace lo suyo.
+**staging** es donde está la lógica de limpieza. La tabla es `UNLOGGED`: se recrea en cada corrida, así que no tiene sentido pagar el costo del WAL (el log que Postgres usa para recuperarse de un crash). Si se pierde, se vuelve a correr el paso y listo.
 
-Cada paso es **idempotente**: raw y core se recargan completos (`TRUNCATE` + carga) dentro de una transacción, así que correr el pipeline dos veces da el mismo resultado y un fallo a mitad no deja datos a medias. Elegí *full refresh* y no carga incremental porque la fuente es un archivo estático y, sobre todo, porque **no trae un identificador de oferta**: sin clave natural, un upsert incremental no tiene contra qué comparar (ver más abajo).
+**core** se llena solo con SQL: `INSERT ... SELECT` resolviendo cada clave por el nombre natural del catálogo.
+
+Todos los pasos son idempotentes: `raw` y `core` se recargan completos (`TRUNCATE` + carga) dentro de una transacción. Correrlo dos veces da el mismo resultado, y si algo falla a la mitad la base queda como estaba. Elegí recarga completa y no incremental por dos razones. La fuente es un archivo estático, y además el CSV no trae un id de oferta: sin una clave estable no hay contra qué hacer un upsert.
 
 ### Resultado de una corrida completa
 
-En mi laptop (Windows 11, todo dentro de Docker) la corrida completa tarda unos 4 minutos:
+En mi laptop (Windows 11, todo dentro de Docker):
 
 | Paso | Tiempo |
 |---|---|
@@ -120,244 +123,337 @@ En mi laptop (Windows 11, todo dentro de Docker) la corrida completa tarda unos 
 | `platforms` | 7.884 | `skills` | 252 |
 | `search_locations` | 173 | `skill_types` | 10 |
 | `countries` | 168 | `job_roles` | 10 |
-| `schedule_types` | 7 | rechazadas | 102 |
+| `schedule_types` | 7 | rechazadas (staging) | 102 |
 
-### Cómo bajó de 10 a 4 minutos
-
-La primera corrida completa tardó casi 10 minutos, 7 de ellos en el paso core. Mi primera sospecha fue que a las tablas recién cargadas les faltaban estadísticas y el planner elegía mal los joins. Agregué `ANALYZE` después de cada carga masiva, que es buena práctica de todas formas, pero solo bajó a 5,5 minutos: no era la causa principal.
-
-Medí cada sentencia por separado y dos concentraban el tiempo: el `INSERT` en `jobs` (2 min) y en `job_skills` (2 min 42 s). Con `EXPLAIN ANALYZE` quedó claro el motivo: de los 128 s del `INSERT` en `jobs`, 109 s eran los triggers internos que validan las 5 FK, uno por fila y por FK. El join en sí era rápido.
-
-La solución es la misma que usa `pg_restore`: dentro de la transacción se quitan las FK, se cargan los datos y se recrean. Al recrearlas, Postgres valida todas las filas de una vez con un solo join en lugar de millones de búsquedas individuales. La integridad no se relaja: si una fila no cumple, la FK no se crea y toda la transacción se deshace. Las definiciones se leen del catálogo (`pg_get_constraintdef`), así que `sql/schema.sql` sigue siendo la única fuente del DDL. El paso core bajó de 410 s a 63 s.
+785.639 ofertas cargadas + 102 rechazadas = 785.741 filas del CSV. Esa cuenta la verifica el pipeline en cada corrida.
 
 ---
 
 ## Lo que encontré en los datos
 
-Antes de diseñar perfilé todo el archivo. Casi todas las decisiones del modelo salen de esta tabla:
+Este es el resumen del perfilado. Cada fila de esta tabla terminó siendo una regla de limpieza, una decisión del modelo o una limitación documentada.
 
-| Hallazgo | Magnitud | Qué hice |
+| Hallazgo | Cuántos | Qué hice |
 |---|---|---|
-| Filas idénticas en las 17 columnas (misma fecha al segundo) | 101 | Rechazadas como duplicado, se conserva la primera |
-| Filas iguales salvo `job_posted_date` | ~36.500 | **No** son duplicados: son republicaciones de la misma oferta. Se conservan |
-| Fila sin título, empresa, ubicación ni skills | 1 | Rechazada (`sin job_title`) |
-| `job_schedule_type` compuesto: "Full-time, Part-time, and Internship" | 48 combinaciones de 7 tipos | Se separa en tabla N:M. También traduzco "Pekerjaan tetap" y "Kontraktor" (etiquetas de Google Jobs en indonesio) |
-| `job_via` con prefijo "via " y a veces "melalui " (indonesio) | 100% de filas | Se quita el prefijo |
-| Misma empresa con distinta capitalización: "BNP Paribas", "Bnp Paribas", "BNP PARIBAS" | 8.922 grupos | Se unifican por clave normalizada: 139.985 nombres → 130.368 empresas |
-| `job_location` con sufijo "(+3 others)" | 2.642 | Se quita el sufijo; se conserva la ubicación principal |
-| Skills repetidos dentro de la misma oferta (`['sas', ..., 'sas']`) | 63.811 ofertas | Pasa con sas, mongodb, ruby y firebase, que el extractor clasifica en dos tipos a la vez. Se deduplica |
-| `job_country` = "Sudan" en ofertas de Texas y Nuevo México | 21.781 | Ver la decisión sobre país más abajo. Se documenta, no se "corrige" |
-| Búsqueda "Georgia" (el país) devolvió ofertas de Georgia (el estado de EE. UU.) | 32.424 | Mismo caso |
-| `job_country` vacío | 49 | Todas vienen de búsquedas a nivel país ("Gabon"); se completa con ese país |
-| `salary_rate` = month/week/day | 401 | No traen promedio (solo existen columnas anual y horaria). Se guarda la tarifa sin monto |
-| `salary_hour_avg` con ruido flotante (61.159996) | — | Se redondea a centavos en core; raw guarda el valor original |
-| Títulos truncados por el scraper ("...") | 15.790 | No hay forma de recuperarlos; se dejan |
-| `job_work_from_home = True` ⇔ `job_location = 'Anywhere'` | 69.552 (coincidencia exacta) | Se mantiene como atributo de la oferta (ver decisiones) |
+| Filas idénticas en las 17 columnas, fecha incluida al segundo | 101 | Las rechazo como duplicado y conservo la primera |
+| Filas iguales salvo `job_posted_date` | unas 36 mil | Las dejo: son republicaciones de la misma oferta en otra fecha, no duplicados |
+| Una fila sin título, empresa, ubicación ni skills | 1 | Rechazada |
+| `job_schedule_type` con varios valores: "Full-time, Part-time, and Internship" | 48 combinaciones de 7 tipos | La separo en una relación N:M |
+| Jornadas en indonesio: "Pekerjaan tetap", "Kontraktor" | 62 | Las traduzco a Full-time y Contractor (son las etiquetas de Google Jobs en ese idioma) |
+| `job_via` con el prefijo "via " (y "melalui " en Indonesia) | todas | Quito el prefijo |
+| La misma empresa escrita distinto: "BNP Paribas", "Bnp Paribas", "BNP PARIBAS" | 8.922 grupos | Las unifico: 139.985 nombres pasan a 130.368 empresas |
+| Ubicaciones con "(+3 others)" al final | 2.642 | Quito el sufijo y conservo la ubicación principal |
+| El mismo skill dos veces en una oferta (`['sas', ..., 'sas']`) | 63.811 ofertas | Deduplico. Pasa con sas, mongodb, ruby y firebase, que el extractor mete en dos categorías a la vez |
+| Ofertas de Texas y Nuevo México con país "Sudan" | 21.781 | Documentado, no corregido (ver el modelo) |
+| La búsqueda "Georgia" (el país) devolvió ofertas de Georgia, EE. UU. | 32.424 | Mismo caso |
+| `job_country` vacío | 49 | Todas vienen de búsquedas a nivel país ("Gabon", "Sierra Leone"), así que tomo ese país |
+| Tarifa de salario mensual, semanal o diaria | 401 | El CSV solo trae promedio anual y horario, así que guardo la tarifa sin monto |
+| Salarios con ruido de punto flotante (61.159996) | — | Redondeo a centavos en `core`; `raw` guarda el original |
+| Títulos cortados por el scraper ("Senior Clinical Data Engineer / Principal...") | 15.790 | No hay cómo recuperarlos; quedan así |
+| `job_work_from_home = True` exactamente cuando la ubicación es "Anywhere" | 69.552 | Lo dejo como atributo de la oferta (explico por qué abajo) |
+
+Otras cosas que vi y no toqué: entre las "empresas" hay agregadores de empleo (Emprego, Dice) y nombres genéricos como "Confidenziale" para ofertas anónimas. Separarlos requiere criterio de negocio, así que lo dejé anotado en lo que haría con más tiempo.
 
 ---
 
-## Modelo 3FN y decisiones de diseño
+## El modelo 3FN
 
 ```mermaid
 erDiagram
     countries ||--o{ search_locations : ""
     search_locations ||--o{ jobs : ""
-    locations ||--o{ jobs : ""
-    companies ||--o{ jobs : ""
-    platforms ||--o{ jobs : ""
+    locations |o--o{ jobs : ""
+    companies |o--o{ jobs : ""
+    platforms |o--o{ jobs : ""
     job_roles ||--o{ job_titles : ""
     job_titles ||--o{ jobs : ""
+    jobs ||--o| job_salaries : ""
     jobs ||--o{ job_schedule_types : ""
     schedule_types ||--o{ job_schedule_types : ""
     jobs ||--o{ job_skills : ""
     skills ||--o{ job_skills : ""
     skills ||--o{ skill_type_assignments : ""
     skill_types ||--o{ skill_type_assignments : ""
-    jobs ||--o| job_salaries : ""
 
     jobs {
         bigint job_id PK
         bigint source_row_id UK
         int job_title_id FK
-        int company_id FK
-        int location_id FK
+        int company_id FK "nullable"
+        int location_id FK "nullable"
         smallint search_location_id FK
-        smallint platform_id FK
+        smallint platform_id FK "nullable"
         timestamp posted_at
-        bool work_from_home
-        bool no_degree_mention
-        bool health_insurance
+        boolean work_from_home
+        boolean no_degree_mention
+        boolean health_insurance
     }
     job_titles {
         int job_title_id PK
         text job_title UK
         smallint role_id FK
     }
-    search_locations {
-        smallint search_location_id PK
-        text search_location_name UK
-        smallint country_id FK
+    job_roles {
+        smallint role_id PK
+        text role_name UK
     }
     companies {
         int company_id PK
         text company_key UK
         text company_name
     }
+    locations {
+        int location_id PK
+        text location_name UK
+    }
+    search_locations {
+        smallint search_location_id PK
+        text search_location_name UK
+        smallint country_id FK
+    }
+    countries {
+        smallint country_id PK
+        text country_name UK
+    }
+    platforms {
+        smallint platform_id PK
+        text platform_name UK
+    }
     job_salaries {
-        bigint job_id PK
+        bigint job_id PK, FK
         text salary_rate
         numeric salary_year_avg
         numeric salary_hour_avg
     }
+    job_schedule_types {
+        bigint job_id PK, FK
+        smallint schedule_type_id PK, FK
+    }
+    schedule_types {
+        smallint schedule_type_id PK
+        text schedule_type_name UK
+    }
+    job_skills {
+        bigint job_id PK, FK
+        int skill_id PK, FK
+    }
+    skills {
+        int skill_id PK
+        text skill_name UK
+    }
+    skill_type_assignments {
+        int skill_id PK, FK
+        smallint skill_type_id PK, FK
+    }
+    skill_types {
+        smallint skill_type_id PK
+        text skill_type_name UK
+    }
 ```
 
-Para llegar a 3FN me guié por una pregunta en cada columna: *¿de qué depende realmente este dato?* Y la respuesta la verifiqué contra los datos, no solo contra el diccionario.
+En las líneas, `||` significa "exactamente uno", `|o` "cero o uno" y `o{` "cero o muchos". Por ejemplo, `companies |o--o{ jobs` se lee: una oferta tiene como máximo una empresa (la FK admite nulos) y una empresa tiene muchas ofertas. El mismo modelo está en [`docs/erd.dbml`](docs/erd.dbml), que se puede abrir en dbdiagram.io.
 
-### 1. El rol depende del título, no de la oferta
+### Qué guarda cada tabla
 
-El diccionario dice que `job_title_short` se calcula a partir de `job_title`, y en los datos se cumple sin excepción: cada uno de los 234.674 títulos distintos tiene exactamente un rol. Si dejara `role_id` en `jobs` tendría una dependencia transitiva (`job → job_title → rol`), que es justo lo que 3FN prohíbe. Por eso existe `job_titles` con su `role_id`, y `jobs` solo apunta al título.
+| Tabla | Qué es | De dónde sale |
+|---|---|---|
+| `jobs` | Una fila por oferta publicada, con sus tres flags | Cada fila válida del CSV |
+| `job_titles` | Cada título distinto y el rol que le corresponde | `job_title` + `job_title_short` |
+| `job_roles` | Los 10 roles estandarizados (Data Engineer, Data Analyst...) | `job_title_short` |
+| `companies` | Empresas unificadas por nombre normalizado | `company_name` |
+| `locations` | Texto de ubicación de la oferta ("Bogotá, Colombia", "Anywhere") | `job_location` |
+| `search_locations` | La búsqueda que hizo el bot y el país que le asignó | `search_location` + `job_country` |
+| `countries` | Países | `job_country` |
+| `platforms` | Dónde se publicó (LinkedIn, Indeed...) | `job_via` |
+| `job_salaries` | Tarifa y promedios, solo para ofertas con salario | `salary_*` |
+| `schedule_types` + `job_schedule_types` | Tipos de jornada y la relación N:M con las ofertas | `job_schedule_type` |
+| `skills` + `job_skills` | Skills y la relación N:M con las ofertas | `job_skills` |
+| `skill_types` + `skill_type_assignments` | Categorías de skill y la relación N:M con los skills | `job_type_skills` |
 
-Aquí me equivoqué primero y vale la pena contarlo. Mi primera versión normalizaba espacios en los títulos, y el chequeo de dependencias funcionales del pipeline falló: 26 títulos quedaron con dos roles. Mirando los casos, "MIS Analyst" aparece 60 veces como *Data Scientist* y "MIS  Analyst" (doble espacio) como *Software Engineer*. El rol se calculó sobre el texto exacto, así que "limpiar" el título invalida la derivación. Decidí guardar el título tal cual viene.
+### Decisiones
 
-### 2. El país depende de la búsqueda, no de la ubicación
+Para cada columna me hice la misma pregunta: ¿de qué depende realmente este dato? En 3FN cada atributo tiene que depender de la clave de su tabla y de nada más. Lo importante es que la respuesta no la saqué solo del diccionario de datos. Cada dependencia la medí en las 785 mil filas, y el pipeline las vuelve a verificar en cada corrida.
 
-Lo intuitivo era poner el país en `locations`. Los datos no lo permiten: `job_location → job_country` falla en 1.166 ubicaciones ("Abilene, TX" aparece como United States y como Sudan). En cambio `search_location → job_country` se cumple en el 100% de las filas. El país es un atributo de la búsqueda que hizo el bot, y por eso cuelga de `search_locations`.
+#### El rol depende del título, no de la oferta
 
-Esto deja expuesto un problema del origen: la búsqueda "Sudan" trajo 21.781 ofertas que en su mayoría son de EE. UU. No lo corregí, porque para hacerlo bien habría que geocodificar `job_location` y eso es otro proyecto. Prefiero que el modelo refleje fielmente lo que dice la fuente y que el problema quede documentado y localizado (es una sola fila en `search_locations`), a meter una corrección a medias en la fuente de verdad.
+Según el diccionario, `job_title_short` se calcula a partir de `job_title`, y en los datos se cumple siempre: cada uno de los 234.674 títulos distintos tiene un solo rol. Si dejaba `role_id` en `jobs`, el rol dependería de la oferta a través del título (`job → job_title → rol`). Esa es una dependencia transitiva, justo lo que 3FN no permite. En la práctica, el título "Data Engineer" aparece en casi 54 mil ofertas: su rol se repetiría en cada una y nada impediría que alguna dijera otra cosa. Por eso existe `job_titles` con su `role_id`, y `jobs` solo apunta al título.
 
-### 3. `job_work_from_home` se queda en `jobs`
+Aquí me equivoqué al principio. Mi primera versión limpiaba los espacios de los títulos (dobles espacios, espacios al final), y el chequeo de dependencias del pipeline falló: 26 títulos quedaron con dos roles distintos. Cuando miré los casos lo entendí. "MIS Analyst" aparece 60 veces como *Data Scientist* y "MIS  Analyst", con doble espacio, como *Software Engineer*. El rol se calculó sobre el texto exacto, así que si "limpio" el título rompo la relación que el propio origen definió. Terminé guardando el título tal cual viene. Sin el chequeo automático esto habría pasado de largo.
 
-En este dataset `work_from_home` coincide exactamente con `location = 'Anywhere'`, así que podría argumentarse que es una dependencia `location → remoto`. No la modelé así porque una dependencia funcional es una regla del negocio, no una coincidencia de la muestra: una oferta en "Bogotá, Colombia" puede perfectamente ser remota. La coincidencia viene de cómo el scraper rotula las ofertas remotas, y si la fuente cambia ese comportamiento el modelo no debería romperse. Para el título sí acepté la dependencia porque la respaldan dos cosas: el diccionario la define y los datos la confirman.
+#### El país depende de la búsqueda, no de la ubicación
 
-### 4. Skills: N:M con ofertas y también N:M con tipos
+Lo natural habría sido poner `country_id` en `locations`. No lo hice porque los datos no lo permiten: `job_location → país` falla en 1.166 ubicaciones. "Abilene, TX", por ejemplo, aparece con país United States y también con Sudan. En cambio `search_location → país` se cumple en el 100% de las filas. O sea, el bot asigna el país según la búsqueda que hizo, no según dónde queda la oferta. El diccionario dice "Country extracted from the location", pero el dato real dice otra cosa, así que modelé lo que pasa de verdad: el país cuelga de `search_locations`.
 
-`job_skills` resuelve la relación muchos a muchos entre ofertas y skills, con PK compuesta `(job_id, skill_id)`.
+Eso deja a la vista un problema del origen: la búsqueda "Sudan" trajo 21.781 ofertas que en su mayoría son de Estados Unidos. Lo pensé bastante y decidí no corregirlo. Hacerlo bien implica geocodificar `job_location`, que es otro proyecto, y una corrección a medias dentro de la fuente de verdad es peor que un error conocido y documentado. Además, con este diseño el error queda en un solo lugar (una fila de `search_locations`) en vez de repartido en miles de ofertas.
 
-Lo menos obvio fue el tipo de skill. Pensaba ponerlo como `skill_type_id` en `skills`, pero sas, mongodb, ruby y firebase pertenecen a dos tipos (sas es `programming` y `analyst_tools`), y eso pasa en el 100% de sus apariciones. Es decir, la clasificación es propiedad del skill, no de la oferta. Por eso existe `skill_type_assignments` como N:M entre skills y tipos, y no hace falta guardar el tipo por oferta.
+#### `work_from_home` se queda en `jobs`
 
-Consecuencia: `job_type_skills` no se almacena en `core`, porque se puede reconstruir con `job_skills` + `skill_type_assignments`. No me quedé con la suposición: uno de los chequeos de calidad reconstruye el diccionario de las 785 mil ofertas y lo compara contra staging. Cero diferencias.
+En este dataset `work_from_home` es verdadero exactamente cuando la ubicación es "Anywhere", así que se podría argumentar que depende de la ubicación. No lo modelé así. Una dependencia funcional es una regla del negocio, no algo que coincide en una muestra: una oferta en Bogotá puede ser remota sin problema. La coincidencia viene de cómo el scraper etiqueta las ofertas remotas. Si mañana cambia eso, no quiero que el modelo deje de ser correcto. Con el título sí acepté la dependencia porque la respaldan dos cosas a la vez: el diccionario la define y los datos la confirman.
 
-### 5. Jornada: el texto compuesto rompe 1FN
+#### Skills: dos relaciones N:M, no una
 
-"Full-time and Part-time" son dos valores en una celda, lo que viola la primera forma normal. Se separa en `schedule_types` (7 tipos) y la puente `job_schedule_types`. Una oferta sin jornada (1,6%) simplemente no tiene filas en la puente.
+La relación muchos a muchos entre ofertas y skills se resuelve con `job_skills`, de PK compuesta `(job_id, skill_id)`.
 
-### 6. Salario en una tabla aparte
+Lo que no esperaba fue el tipo de skill. Mi idea era una columna `skill_type_id` en `skills`, pero sas, mongodb, ruby y firebase pertenecen a dos tipos (sas es `programming` y también `analyst_tools`), y eso pasa en todas sus apariciones, no solo en algunas ofertas. Es decir, la clasificación es una propiedad del skill, no de la oferta. Por eso hay una segunda N:M, `skill_type_assignments`, entre skills y tipos. De paso, eso explica por qué esos skills aparecían repetidos en las listas del CSV.
 
-Solo el 4,2% de las ofertas publica salario. Guardarlo en `jobs` serían tres columnas casi siempre nulas, así que va en `job_salaries`, relación 1:0..1 con `jobs`. Los `CHECK` fijan la regla del origen: el promedio anual solo existe con tarifa anual y el horario con tarifa horaria. No convertí horario a anual (por ejemplo × 2080 horas): esa es una suposición analítica que corresponde a la capa de consumo, no a la fuente de verdad.
+La consecuencia es que `job_type_skills` no se guarda en `core`: se puede reconstruir uniendo `job_skills` con `skill_type_assignments`. No quise dejar esto como suposición, así que uno de los chequeos de calidad reconstruye el diccionario para las 785 mil ofertas y lo compara contra el original. Da cero diferencias.
 
-`salary_rate` lo dejé como `CHECK` sobre cinco valores y no como tabla catálogo. Son valores fijos y sin atributos propios; una tabla agregaría un join sin aportar nada.
+#### La jornada rompía 1FN
 
-### 7. Claves sustitutas y linaje
+"Full-time and Part-time" son dos valores en una sola celda, lo que viola la primera forma normal. Lo separé en `schedule_types` (7 tipos) y la tabla puente `job_schedule_types`. El 1,6% de las ofertas no trae jornada; esas simplemente no tienen filas en la puente, en vez de guardar un "desconocido" inventado.
 
-El origen no trae id de oferta y hay ~36 mil filas idénticas salvo la fecha, así que no hay clave natural confiable para `jobs`. Uso `job_id` como identidad y guardo `source_row_id` (con `UNIQUE`) para trazar cada oferta hasta su fila del CSV.
+#### El salario va en su propia tabla
 
-Los catálogos también usan claves sustitutas (`IDENTITY`), pero su clave natural lleva `UNIQUE`. Eso tiene un efecto que me gusta: los propios constraints validan las dependencias. Si un título llegara con dos roles, el `INSERT` en `job_titles` fallaría en lugar de cargar datos ambiguos.
+Solo el 4,2% de las ofertas publica salario. Ponerlo en `jobs` eran tres columnas vacías en el 96% de las filas, así que va en `job_salaries`, con relación de cero o uno con `jobs`. Los `CHECK` de la tabla dejan escrita la regla del origen: el promedio anual solo existe con tarifa anual y el horario solo con tarifa horaria.
 
-### 8. Empresas: unificación conservadora
+No convertí el salario horario a anual (multiplicando por 2.080 horas, por ejemplo). Esa es una suposición de análisis, y me parece que corresponde a la capa de consumo, no a la fuente de verdad. La tarifa (`salary_rate`) la dejé como un `CHECK` con cinco valores y no como tabla catálogo: son valores fijos, sin atributos propios, y una tabla solo agregaba un join.
 
-La identidad de una empresa es su nombre en minúsculas y con espacios colapsados (`company_key`); para mostrar se usa la variante más frecuente. A propósito **no** quité sufijos legales (Inc., S.A., LLC) ni hice fuzzy matching: un falso positivo fusiona dos empresas distintas en la fuente de verdad y es muy difícil de detectar después. Me pareció mejor dejar algunos duplicados que ensuciar datos correctos.
+#### Claves sustitutas, con la natural como `UNIQUE`
 
-### Otros detalles
+Para `jobs` no hay clave natural confiable: no viene id de oferta y hay ~36 mil filas que solo difieren en la fecha. Uso `job_id` (`IDENTITY`) y guardo `source_row_id` con `UNIQUE` para el linaje.
 
-- Índices en todas las FK de `jobs` y en el lado "skill" de las puentes. Postgres no indexa las FK automáticamente.
-- `posted_at` es `TIMESTAMP` sin zona horaria porque el origen no la trae; asumir UTC sería inventar.
-- Tipos chicos (`SMALLINT`) en catálogos con pocos valores, `BIGINT` en `jobs` pensando en crecimiento.
+En los catálogos también uso claves sustitutas, pero la clave natural (el nombre) lleva `UNIQUE`. Eso tiene un efecto que me gustó: los mismos constraints validan las dependencias. Si un título llegara con dos roles, el `INSERT` en `job_titles` fallaría en lugar de cargar datos ambiguos.
+
+#### Empresas: prefiero duplicados a fusiones equivocadas
+
+La identidad de una empresa (`company_key`) es su nombre en minúsculas y con los espacios colapsados. Para mostrar se usa la variante más frecuente ("BNP Paribas" le gana a "BNP PARIBAS"). No quité sufijos legales (Inc., S.A., LLC) ni hice fuzzy matching. Un falso positivo junta dos empresas distintas dentro de la fuente de verdad y después es casi imposible de detectar. Algunos duplicados que quedan son un mal menor.
+
+#### Detalles menores
+
+- Puse índices en todas las FK de `jobs` y en el lado "skill" de las tablas puente. Postgres no los crea solo, y sin ellos cada join contra un catálogo recorre la tabla completa.
+- `posted_at` es `TIMESTAMP` sin zona horaria porque el origen no la trae. Asumir UTC sería inventar.
+- Usé `SMALLINT` en los catálogos chicos y `BIGINT` en `jobs`.
 
 ---
 
-## Por qué estas herramientas
+## Rendimiento: de 10 a 4 minutos
 
-- **PostgreSQL + Docker Compose:** es lo que pide la prueba y además encaja con el problema: tiene `TEXT[]` y `JSONB` nativos para la capa raw, y `unnest` / `jsonb_each` para desarmarlos en SQL. Compose deja el entorno reproducible con un comando.
-- **psycopg 3 con `COPY`:** cargar 785 mil filas con `INSERT` fila a fila es lento; `COPY` es el mecanismo de carga masiva de Postgres. psycopg 3 adapta directamente listas de Python a `TEXT[]` y dicts a `JSONB` dentro del `COPY`.
-- **pandas:** el volumen (785 mil filas) cabe holgado en memoria. Spark o Polars serían exagerar para esto.
-- **`ast.literal_eval` para las listas y dicts:** vienen como repr de Python (comillas simples), así que `json.loads` no sirve. `literal_eval` solo evalúa literales, a diferencia de `eval`, que ejecutaría cualquier código del archivo. Además se parsea cada texto distinto una sola vez (177 mil de 668 mil), lo que bajó la lectura de ~95 s a ~23 s.
-- **SQL plano y no dbt para staging → core:** con un solo destino y 15 tablas, un archivo SQL legible en una transacción es suficiente. dbt tendría sentido si el modelo creciera o si varios equipos lo mantuvieran, y la migración sería directa porque cada `INSERT ... SELECT` ya es prácticamente un modelo.
-- **Pandera:** contratos de datos declarativos sobre DataFrames, que es justo lo que se valida antes de cada carga.
-- **uv:** resuelve y bloquea dependencias (`uv.lock`) en segundos. `requirements.txt` se exporta desde el lock para quien prefiera pip.
+La primera corrida completa tardó casi 10 minutos, 7 de ellos en el paso a `core`. Para 785 mil filas era demasiado.
+
+Mi primera sospecha fue que a las tablas recién cargadas les faltaban estadísticas y el planner de Postgres armaba mal los joins. Agregué `ANALYZE` después de cada carga grande. Es buena práctica igual, pero solo bajó a 5,5 minutos, así que no era el problema principal.
+
+Entonces dejé de adivinar y medí cada sentencia por separado, dentro de una transacción que luego deshacía. Dos sentencias se llevaban casi todo: el `INSERT` en `jobs` (2 minutos) y el de `job_skills` (2 minutos 42 segundos). Con `EXPLAIN ANALYZE` sobre el primero apareció la causa: de 128 segundos, 109 eran los triggers que validan las 5 llaves foráneas. Postgres verifica cada FK fila por fila, y eso da 785 mil verificaciones por FK. El join en sí era rápido.
+
+La solución es la misma que usa `pg_restore` al restaurar un backup. Dentro de la transacción se quitan las FK, se cargan los datos y se vuelven a crear. Al recrearlas, Postgres valida todas las filas de una vez con un solo join. La integridad no se relaja: si una fila no cumple, la FK no se crea, la transacción falla y se deshace completa. Hay un test que verifica que las 14 FK quedan activas después de cada carga.
+
+Para no duplicar el DDL, las definiciones se leen del catálogo de Postgres (`pg_get_constraintdef`) antes de quitarlas. Así `sql/schema.sql` sigue siendo el único lugar donde están definidas.
+
+El paso `core` bajó de 410 a 63 segundos.
 
 ---
 
-## Calidad de datos y tests
+## Herramientas, y por qué esas
 
-La calidad se valida en tres momentos:
+**PostgreSQL + Docker Compose.** Es lo que pide la prueba, y además le queda bien al problema: Postgres tiene `TEXT[]` y `JSONB` nativos para la capa raw, y `unnest` / `jsonb_each` para desarmarlos en SQL. Compose deja todo reproducible con un par de comandos, y el healthcheck de la base evita que el pipeline intente conectarse antes de tiempo.
 
-1. **Antes de cargar raw** (Pandera, `validation.raw_schema`): tipos, nulos, tarifas válidas, salarios positivos, que `job_skills` y `job_type_skills` describan los mismos skills, y que el promedio anual/horario sea coherente con la tarifa.
-2. **Antes de cargar staging** (Pandera + chequeo de dependencias funcionales): `job_title → rol`, `search_location → país` y `company_key → nombre`. Si se rompen, el modelo dejaría de ser correcto, así que el pipeline se detiene con un mensaje que dice qué valores las rompen.
-3. **Después de cargar core** (SQL, `load_core.QUALITY_CHECKS`):
-   - conciliación: filas en raw = ofertas en core + rechazadas;
-   - todos los skills y jornadas de staging están en las puentes;
-   - `job_type_skills` se reconstruye exactamente desde el modelo;
-   - todos los salarios llegaron.
+**psycopg 3 con `COPY`.** Cargar 785 mil filas con `INSERT` una por una es muy lento. `COPY` es el mecanismo de carga masiva de Postgres, y psycopg 3 convierte las listas de Python en `TEXT[]` y los diccionarios en `JSONB` dentro del mismo `COPY`.
 
-### Correr los tests
+**pandas.** El volumen cabe holgado en memoria. Spark o Polars me parecieron exagerados para esto. El cuello de botella real de la lectura era otro (el siguiente punto), y se arreglaba sin cambiar de librería.
+
+**`ast.literal_eval` para las listas y diccionarios.** `job_skills` y `job_type_skills` vienen como texto con sintaxis de Python (`['python', 'sql']`, con comillas simples), que no es JSON válido, así que `json.loads` no sirve. Uso `literal_eval` y no `eval` porque `eval` ejecutaría cualquier código que venga en el archivo. Como hay solo 177 mil textos distintos entre 668 mil filas, se parsea cada uno una sola vez. Eso bajó la lectura de 95 a 23 segundos.
+
+**SQL plano, sin dbt, para staging → core.** Con un solo destino y 15 tablas, un archivo SQL en una transacción es suficiente y fácil de seguir. dbt empieza a pagar cuando el proyecto crece o lo mantienen varias personas: linaje, documentación, tests declarativos. Si llegara ese momento, la migración sería directa, porque cada `INSERT ... SELECT` ya es casi un modelo.
+
+**Pandera.** Permite declarar contratos sobre DataFrames (tipos, nulos, rangos, reglas entre columnas) y validarlos antes de cargar. Es lo que sugiere la prueba y encajó bien.
+
+**uv.** Instala y bloquea las dependencias (`uv.lock`) en segundos. El `requirements.txt` se exporta desde el lock para quien prefiera pip.
+
+---
+
+## Calidad de datos
+
+La calidad se revisa en tres momentos. La idea es que si algo está mal, el pipeline se detenga con un mensaje claro en vez de cargar datos dudosos.
+
+**Antes de cargar raw** (Pandera, `validation.raw_schema`): tipos, nulos donde no deben haber, tarifas válidas, salarios positivos, que `job_skills` y `job_type_skills` describan exactamente los mismos skills, y que los promedios anual y horario sean coherentes con la tarifa.
+
+**Antes de cargar staging** (Pandera + dependencias funcionales): además del contrato, se verifica que se cumplan `job_title → rol`, `search_location → país` y `company_key → nombre`. El modelo se apoya en esas tres. Si se rompen, el pipeline se detiene y dice qué valores las rompen. Este chequeo fue el que atrapó el problema de los títulos.
+
+**Después de cargar core** (SQL, `load_core.QUALITY_CHECKS`):
+
+- Conciliación: filas en raw = ofertas en core + rechazadas.
+- Todos los skills y todas las jornadas de staging están en sus tablas puente.
+- `job_type_skills` se reconstruye exactamente desde el modelo.
+- Todos los salarios llegaron.
+
+---
+
+## Tests
 
 ```bash
-uv run pytest                 # unitarios + integración
-uv run pytest -m "not integration"   # solo unitarios, sin base de datos
+uv run pytest                          # todo
+uv run pytest -m "not integration"     # solo unitarios, no necesitan base de datos
 uv run ruff check . && uv run ruff format --check .
 ```
 
-- **Unitarios** (`test_extract`, `test_cleaning`, `test_validation`, `test_stage`): cubren parseo de los campos semiestructurados, cada regla de limpieza y los contratos. Usan [`tests/fixtures/sample_jobs.csv`](tests/fixtures/sample_jobs.csv), un CSV de 8 filas armado a mano donde cada fila representa un caso real del perfilado (duplicado exacto, republicación, fila sin título, "melalui", "(+3 others)", sas en dos tipos, país vacío, tarifa mensual, títulos que difieren solo en espacios).
-- **Integración** (`test_integration`): corre el pipeline completo dos veces (para probar idempotencia) contra una base aparte `<POSTGRES_DB>_test` y verifica los conteos exactos de las 17 tablas. Si no hay Postgres disponible se saltan solos; en CI corren contra un Postgres real.
+Los **unitarios** (`test_extract`, `test_cleaning`, `test_validation`, `test_stage`) cubren el parseo de las columnas semiestructuradas, cada regla de limpieza y los contratos de Pandera. Usan [`tests/fixtures/sample_jobs.csv`](tests/fixtures/sample_jobs.csv), un CSV de 8 filas que armé a mano para que cada fila represente un caso real del perfilado:
+
+- un duplicado exacto y una republicación;
+- la fila sin título;
+- el prefijo "melalui" y el sufijo "(+3 others)";
+- sas en dos categorías y un país vacío;
+- una tarifa mensual;
+- dos títulos que solo difieren en un espacio y tienen roles distintos.
+
+Los de **integración** (`test_integration`) corren el pipeline completo dos veces seguidas contra una base aparte (`<POSTGRES_DB>_test`) y verifican los conteos exactos de 17 tablas. Correrlo dos veces es la prueba de idempotencia. Si no hay Postgres disponible se saltan solos; en el CI corren contra un Postgres real.
 
 ---
 
-## Limitaciones y qué haría con más tiempo
+## Lo que no hice, y qué haría con más tiempo
 
-- **Geocodificar `job_location`** para tener ciudad / región / país reales y corregir los casos "Sudan" y "Georgia". Es el problema de calidad más grande del dataset.
-- **Resolución de entidades de empresas** más agresiva (sufijos legales, fuzzy matching), pero con revisión humana de los merges. También separar agregadores (Dice, Emprego) y placeholders ("Confidenziale") de los empleadores reales.
-- **Ubicaciones múltiples:** el scraper solo guarda la primera ciudad de "(+3 others)". Si la fuente diera la lista completa, sería otra N:M.
-- **Carga incremental:** requeriría un identificador estable de oferta en la fuente, o al menos un hash de contenido acordado como clave.
-- **Migraciones** con Alembic o similar en lugar de `CREATE TABLE IF NOT EXISTS`, para poder evolucionar el esquema sin recrear.
-
----
-
-## Bonus: orquestación y CI/CD
-
-**CI (implementado):** [`.github/workflows/ci.yml`](.github/workflows/ci.yml) corre ruff (lint + formato) y pytest en cada push y pull request. Levanta Postgres como *service container*, así que los tests de integración también corren en CI.
-
-**Orquestación (no implementada, cómo la haría):** el CLI ya está partido en pasos (`--step extract|stage|core`) que mapean uno a uno a tareas. En Airflow sería un DAG `extract >> stage >> core >> quality_checks`, cada tarea llamando a la misma función de Python, con reintentos en las tareas que tocan la base y un sensor sobre la llegada de un archivo nuevo. No lo implementé porque Airflow suma scheduler, webserver y su propia base de metadatos al compose para orquestar un archivo estático que se procesa en minutos; preferí invertir ese tiempo en el modelo y la calidad. Si hubiera que elegir algo liviano para este tamaño, Prefect o Dagster con un `@flow` envolviendo `run()` serían suficientes.
+- **Geocodificar `job_location`** para tener ciudad, región y país reales y corregir lo de "Sudan" y "Georgia". Es el problema de calidad más grande del dataset.
+- **Resolver mejor las empresas**: sufijos legales, fuzzy matching con revisión humana de los merges, y separar agregadores (Dice, Emprego) y nombres genéricos ("Confidenziale") de los empleadores reales.
+- **Guardar todas las ubicaciones** de las ofertas con "(+3 others)". El scraper solo guarda la primera; si la fuente diera la lista completa, sería otra relación N:M.
+- **Carga incremental**, que necesitaría un id estable de oferta en la fuente o al menos un hash de contenido acordado como clave.
+- **Migraciones** con Alembic o similar, en lugar de `CREATE TABLE IF NOT EXISTS`, para poder cambiar el esquema sin recrearlo.
 
 ---
 
-## Bonus: diseño de un modelo estrella (OLAP)
+## Bonus: CI y orquestación
 
-El modelo 3FN está optimizado para escribir sin redundancia. Un dashboard necesita lo contrario: pocas uniones y filtros simples. Así diseñaría la estrella a partir de `core`.
+**CI (implementado).** [`.github/workflows/ci.yml`](.github/workflows/ci.yml) corre ruff (lint y formato) y pytest en cada push y pull request. Levanta Postgres como *service container*, así que los tests de integración también corren ahí y no solo en mi máquina.
+
+**Orquestación (no implementada).** El CLI ya está partido en pasos (`--step extract|stage|core`) pensando en esto: cada paso se convertiría en una tarea. En Airflow sería un DAG `extract >> stage >> core >> quality_checks`, cada tarea llamando a la misma función de Python, con reintentos en las que tocan la base y un sensor que espere la llegada de un archivo nuevo. No lo implementé porque Airflow suma un scheduler, un webserver y su propia base de metadatos para orquestar un archivo estático que se procesa en 4 minutos, y preferí dedicarle ese tiempo al modelo y a la calidad. Para algo de este tamaño, Prefect o Dagster con un flow que envuelva `run()` alcanzarían.
+
+---
+
+## Bonus: un modelo estrella para BI
+
+El modelo 3FN está pensado para guardar sin redundancia. Un dashboard necesita casi lo contrario: pocas uniones, filtros simples y medidas listas para agregar. Así armaría la estrella a partir de `core`.
 
 ### Tabla de hechos
 
-**`fact_job_posting`**, con granularidad de **una fila por oferta publicada** (la misma que `core.jobs`). Es la granularidad más fina disponible y desde ella se agrega a cualquier nivel.
+`fact_job_posting`, con **una fila por oferta publicada**, que es la misma granularidad de `core.jobs`. Es lo más fino que tiene la fuente, y desde ahí se puede agregar a cualquier nivel (por mes, por país, por rol).
 
-| Medida | Tipo | Nota |
+| Medida | Cómo se agrega | Comentario |
 |---|---|---|
-| `posting_count` | aditiva | siempre 1; facilita `SUM` en herramientas de BI |
-| `salary_year_avg` | no aditiva | se promedia, nunca se suma |
-| `salary_hour_avg` | no aditiva | ídem |
-| `salary_year_equivalent` | no aditiva | anual o horaria × 2080, con la suposición explícita en el nombre de la columna |
-| `skill_count` | aditiva | cantidad de skills pedidos |
-| `has_salary` | flag | para calcular % de ofertas con salario publicado |
+| `posting_count` | suma | Siempre 1; hace que contar ofertas sea un `SUM` en cualquier herramienta de BI |
+| `salary_year_avg` | promedio | No tiene sentido sumarla |
+| `salary_hour_avg` | promedio | Igual |
+| `salary_year_equivalent` | promedio | Anual, o horario × 2.080, con esa suposición dicha en el nombre |
+| `skill_count` | suma / promedio | Cuántos skills pide la oferta |
+| `has_salary` | proporción | Para el % de ofertas que publican salario |
 
 ### Dimensiones
 
-- **`dim_date`**: una fila por día (año, trimestre, mes, semana, día de la semana). Clave `date_key` tipo `20230616`.
-- **`dim_company`**: empresa (SCD tipo 1: si cambia el nombre de display, se sobrescribe).
-- **`dim_role`**: título → rol, como jerarquía para poder bajar de "Data Engineer" a los títulos concretos.
-- **`dim_geography`**: búsqueda → país, desnormalizado.
-- **`dim_location`**: ubicación textual de la oferta.
-- **`dim_platform`**: plataforma de publicación.
-- **`dim_schedule`**: una fila por *combinación* de jornadas (son solo 48) con flags `is_full_time`, `is_contractor`, etc. Evita una puente para un caso con tan pocas combinaciones.
-- **`dim_job_flags`** (*junk dimension*): ver abajo.
+- **`dim_date`**: una fila por día, con año, trimestre, mes, semana y día de la semana. Clave tipo `20230616`.
+- **`dim_company`**: la empresa, como SCD tipo 1 (si cambia el nombre que se muestra, se sobrescribe).
+- **`dim_role`**: título y rol como jerarquía, para bajar de "Data Engineer" a los títulos concretos.
+- **`dim_geography`**: búsqueda y país en una sola tabla.
+- **`dim_location`**: la ubicación textual de la oferta.
+- **`dim_platform`**: dónde se publicó.
+- **`dim_schedule`**: una fila por *combinación* de jornadas (son solo 48), con flags como `is_full_time` o `is_contractor`. Con tan pocas combinaciones no hace falta una tabla puente.
+- **`dim_job_flags`**: la junk dimension, explicada abajo.
 
-### Los dos desafíos de diseño
+### Los dos desafíos que plantea la prueba
 
-**Skills (muchos a muchos).** Un hecho por oferta no puede tener "una" FK a skill. Hay dos caminos:
+**Skills (muchos a muchos).** Una fila por oferta no puede tener "una" FK a skill. Veo dos caminos:
 
-1. **Tabla puente** `bridge_job_skill (job_key, skill_key, weight)`, con `weight = 1 / skill_count`. Permite filtrar ofertas por skill desde `fact_job_posting`. El peso existe para el riesgo clásico de las puentes: si se suman salarios atravesando la puente, cada oferta cuenta una vez por cada skill y los totales se inflan. Con el peso, las asignaciones suman 1 por oferta.
-2. **Una segunda tabla de hechos** `fact_job_skill` con granularidad oferta × skill (unos 3,6 millones de filas), con las mismas dimensiones más `dim_skill` (y sus tipos).
+1. Una **tabla puente** `bridge_job_skill (job_key, skill_key, weight)`, con `weight = 1 / skill_count`. Sirve para filtrar ofertas por skill desde `fact_job_posting`. El peso existe por el problema clásico de las puentes: si sumas salarios pasando por la puente, cada oferta se cuenta una vez por cada skill y los totales se inflan. Con el peso, cada oferta suma 1 en total.
+2. Una **segunda tabla de hechos** `fact_job_skill`, con granularidad oferta × skill (3,6 millones de filas), con las mismas dimensiones más `dim_skill` y sus tipos.
 
-Para un dashboard de demanda de skills ("qué skills piden más para Data Engineer en Colombia") elegiría la segunda: es más fácil de usar correctamente en una herramienta de BI y no depende de que el analista recuerde aplicar pesos. La puente la dejaría para análisis que necesiten partir de la oferta y filtrar por skill.
+Para un dashboard de demanda de skills ("qué piden más para Data Engineer en Colombia") me quedaría con la segunda. Es más difícil de usar mal en una herramienta de BI y no depende de que quien arma el reporte se acuerde de los pesos. La puente la dejaría para análisis que parten de la oferta y filtran por skill.
 
-**Flags booleanos (junk dimension).** `work_from_home`, `no_degree_mention` y `health_insurance` son tres booleanos de baja cardinalidad. Como columnas sueltas ensucian el hecho, y como tres dimensiones de dos filas cada una son excesivas. La solución es una **junk dimension** `dim_job_flags` con el producto cartesiano de todas las combinaciones (2³ = 8 filas) y una sola FK en el hecho. Se le pueden sumar otros atributos de baja cardinalidad como `salary_rate` o `has_salary` sin cambiar el diseño. En el dashboard quedan como filtros legibles ("Remoto: Sí / No") en lugar de `true/false`.
+**Los flags booleanos (junk dimension).** `work_from_home`, `no_degree_mention` y `health_insurance` son tres booleanos. Como columnas sueltas ensucian la tabla de hechos, y tres dimensiones de dos filas cada una son demasiadas. La solución es una **junk dimension** `dim_job_flags` con todas las combinaciones posibles (2³ = 8 filas) y una sola FK en el hecho. Se le pueden sumar otros atributos chicos, como `salary_rate` o `has_salary`, sin cambiar el diseño. En el dashboard aparecen como filtros legibles ("Remoto: Sí / No") y no como `true/false`.
 
 ---
 
@@ -366,20 +462,20 @@ Para un dashboard de demanda de skills ("qué skills piden más para Data Engine
 ```
 ├── docker-compose.yml        Postgres + servicio del pipeline
 ├── Dockerfile
-├── pyproject.toml / uv.lock  dependencias (requirements.txt exportado del lock)
+├── pyproject.toml, uv.lock   dependencias (requirements.txt se exporta del lock)
 ├── sql/
 │   ├── raw.sql               capa raw
-│   ├── staging.sql           capa staging + rechazos
-│   ├── schema.sql            modelo 3FN (entregable)
+│   ├── staging.sql           capa staging y tabla de rechazos
+│   ├── schema.sql            modelo 3FN
 │   └── load_core.sql         carga staging -> core
 ├── src/jobs_pipeline/
-│   ├── pipeline.py           CLI y orquestación de pasos
-│   ├── extract.py            fase 1: CSV -> raw
+│   ├── pipeline.py           CLI y orden de los pasos
+│   ├── extract.py            CSV -> raw
 │   ├── cleaning.py           reglas de limpieza (funciones puras)
-│   ├── stage.py              fase 2a: raw -> staging
-│   ├── load_core.py          fase 2b: staging -> core + chequeos de calidad
+│   ├── stage.py              raw -> staging
+│   ├── load_core.py          staging -> core y chequeos de calidad
 │   ├── validation.py         contratos Pandera y dependencias funcionales
-│   ├── config.py / db.py
+│   └── config.py, db.py      configuración y conexión
 ├── tests/
 ├── docs/erd.dbml             diagrama para dbdiagram.io
 └── .github/workflows/ci.yml
