@@ -515,6 +515,8 @@ uv run jobs-pipeline          # o: uv run jobs-flow, para la versión con Prefec
 
 Sin uv también funciona con `pip install -r requirements.txt` y `python -m jobs_pipeline.pipeline`. Si no hay un servidor de Prefect configurado, `jobs-flow` levanta uno temporal solo para esa corrida.
 
+Una cosa con la que me tropecé en Windows: Prefect trae archivos con rutas internas muy largas, y si el repositorio se clona en una carpeta muy profunda se supera el límite de 260 caracteres de Windows. Su servidor temporal no arranca, y los tests del flow se quedan esperando. Con el repo en una ruta corta (por ejemplo `C:\proyectos\`) no pasa. Dentro de Docker tampoco, porque ahí las rutas son de Linux.
+
 ## Estructura del repositorio
 
 ```
