@@ -16,7 +16,7 @@ La sección que más me importa es la de [decisiones del modelo](#el-modelo-3fn)
 
 ## Cómo correrlo
 
-Necesitas Docker (Docker Desktop en Windows/Mac) y el archivo `data_jobs.csv`, que no está en el repo porque pesa ~220 MB. Cópialo en `data/data_jobs.csv`.
+Solo necesitas Docker (Docker Desktop en Windows/Mac) y el archivo `data_jobs.csv`, que no está en el repo porque pesa ~220 MB. Cópialo en `data/data_jobs.csv`. Postgres y Python corren dentro de los contenedores, así que no hace falta instalar ninguno de los dos en tu máquina.
 
 ```bash
 cp .env.example .env                                   # cambia la contraseña si quieres
@@ -44,7 +44,32 @@ Sin uv también funciona con `pip install -r requirements.txt` y `python -m jobs
 
 Si el puerto 5432 ya está ocupado por otro Postgres, cambia `POSTGRES_PORT` en el `.env`.
 
-### Versión orquestada con Prefect
+### Ver el resultado
+
+Cuando termina el pipeline, los datos quedan en la base. Para entrar a la consola de Postgres que corre en el contenedor:
+
+```bash
+docker compose exec db psql -U jobs -d jobs
+```
+
+Ahí, `\dt core.*` lista las tablas del modelo y `\d core.jobs` muestra la estructura de una. Como ejemplo de que el modelo responde preguntas reales, esta consulta da los 10 skills más pedidos en ofertas de Data Engineer. Recorre el camino oferta → título → rol y oferta → skill a través de la tabla puente:
+
+```sql
+SELECT sk.skill_name, count(*) AS ofertas
+FROM core.jobs j
+JOIN core.job_titles t  ON t.job_title_id = j.job_title_id
+JOIN core.job_roles r   ON r.role_id = t.role_id
+JOIN core.job_skills js ON js.job_id = j.job_id
+JOIN core.skills sk     ON sk.skill_id = js.skill_id
+WHERE r.role_name = 'Data Engineer'
+GROUP BY sk.skill_name
+ORDER BY ofertas DESC
+LIMIT 10;
+```
+
+Con el dataset completo debería dar sql (113.118), python (108.013), aws, azure, spark, java, kafka, hadoop, scala y databricks.
+
+### Versión orquestada con Prefect (opcional)
 
 Es el mismo pipeline, con cada paso como tarea de Prefect (detalles en [la sección de orquestación](#bonus-ci-y-orquestación)). Para verlo con la interfaz web:
 
@@ -60,26 +85,6 @@ docker compose --profile orchestration run --rm orchestrator --cron "0 6 * * *"
 ```
 
 Fuera de Docker: `uv sync --all-extras` y luego `uv run jobs-flow`. Si no hay un servidor de Prefect configurado, Prefect levanta uno temporal solo para esa corrida.
-
-Para mirar el resultado:
-
-```bash
-docker compose exec db psql -U jobs -d jobs
-```
-
-```sql
--- Los 10 skills más pedidos para Data Engineer
-SELECT sk.skill_name, count(*) AS ofertas
-FROM core.jobs j
-JOIN core.job_titles t  ON t.job_title_id = j.job_title_id
-JOIN core.job_roles r   ON r.role_id = t.role_id
-JOIN core.job_skills js ON js.job_id = j.job_id
-JOIN core.skills sk     ON sk.skill_id = js.skill_id
-WHERE r.role_name = 'Data Engineer'
-GROUP BY sk.skill_name
-ORDER BY ofertas DESC
-LIMIT 10;
-```
 
 ---
 
