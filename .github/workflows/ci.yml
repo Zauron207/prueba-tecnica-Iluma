@@ -41,7 +41,7 @@ jobs:
           python-version: "3.12"
 
       - name: Instalar dependencias
-        run: uv sync --frozen
+        run: uv sync --frozen --all-extras
 
       - name: Lint
         run: |

@@ -11,6 +11,12 @@ dependencies = [
     "python-dotenv>=1.0",
 ]
 
+[project.optional-dependencies]
+# Solo para correr el pipeline orquestado (jobs-flow); el CLI normal no lo necesita.
+orchestration = [
+    "prefect>=3.4",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=8.0",
@@ -19,6 +25,7 @@ dev = [
 
 [project.scripts]
 jobs-pipeline = "jobs_pipeline.pipeline:main"
+jobs-flow = "jobs_pipeline.flow:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -13,6 +13,8 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+import psycopg
+
 from jobs_pipeline.config import load_settings
 from jobs_pipeline.db import connect
 from jobs_pipeline.extract import load_raw, read_source_csv
@@ -42,28 +44,45 @@ def timed(step: str) -> Iterator[None]:
     log.info("<== %s (%.1f s)", step, time.perf_counter() - start)
 
 
+# Un paso por función. Las usan tanto run() (CLI) como las tareas de Prefect en
+# flow.py, así que la lógica existe en un solo lugar.
+
+
+def extract_step(conn: psycopg.Connection, csv_path: Path) -> None:
+    with timed("extract: CSV -> raw"):
+        if not csv_path.exists():
+            raise FileNotFoundError(f"No existe el CSV: {csv_path}")
+        load_raw(conn, validate_raw(read_source_csv(csv_path)))
+
+
+def stage_step(conn: psycopg.Connection) -> None:
+    with timed("stage: raw -> staging"):
+        staging, rejected = build_staging(read_raw(conn))
+        load_staging(conn, validate_staging(staging), rejected)
+
+
+def core_step(conn: psycopg.Connection) -> None:
+    with timed("core: staging -> modelo 3FN"):
+        load_core(conn)
+
+
+def quality_step(conn: psycopg.Connection) -> None:
+    with timed("chequeos de calidad"):
+        run_quality_checks(conn)
+
+
 def run(steps: tuple[str, ...], csv_path: Path | None = None) -> None:
     settings = load_settings()
     csv_path = csv_path or settings.csv_path
 
     with connect(settings.conninfo) as conn:
         if "extract" in steps:
-            with timed("extract: CSV -> raw"):
-                if not csv_path.exists():
-                    raise FileNotFoundError(f"No existe el CSV: {csv_path}")
-                raw = validate_raw(read_source_csv(csv_path))
-                load_raw(conn, raw)
-
+            extract_step(conn, csv_path)
         if "stage" in steps:
-            with timed("stage: raw -> staging"):
-                staging, rejected = build_staging(read_raw(conn))
-                load_staging(conn, validate_staging(staging), rejected)
-
+            stage_step(conn)
         if "core" in steps:
-            with timed("core: staging -> modelo 3FN"):
-                load_core(conn)
-            with timed("chequeos de calidad"):
-                run_quality_checks(conn)
+            core_step(conn)
+            quality_step(conn)
 
 
 def main(argv: list[str] | None = None) -> None:

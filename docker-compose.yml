@@ -31,5 +31,41 @@ services:
         condition: service_healthy
     profiles: ["pipeline"]
 
+  # --- Orquestación (opcional): servidor de Prefect con su UI en :4200 ---
+
+  prefect-server:
+    build: .
+    entrypoint: ["uv", "run", "--no-sync", "prefect", "server", "start", "--host", "0.0.0.0"]
+    ports:
+      - "4200:4200"
+    volumes:
+      # Historial de corridas de Prefect (SQLite propio), separado de nuestra base.
+      - prefect-data:/root/.prefect
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4200/api/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+    profiles: ["orchestration"]
+
+  orchestrator:
+    build: .
+    entrypoint: ["uv", "run", "--no-sync", "jobs-flow"]
+    env_file: .env
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      CSV_PATH: /app/data/data_jobs.csv
+      PREFECT_API_URL: http://prefect-server:4200/api
+    volumes:
+      - ./data:/app/data:ro
+    depends_on:
+      db:
+        condition: service_healthy
+      prefect-server:
+        condition: service_healthy
+    profiles: ["orchestration"]
+
 volumes:
   pgdata:
+  prefect-data:

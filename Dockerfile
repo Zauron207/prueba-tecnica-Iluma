@@ -8,11 +8,13 @@ ENV UV_COMPILE_BYTECODE=1 \
     PYTHONUNBUFFERED=1
 
 # Primero solo las dependencias: esta capa se reutiliza mientras no cambie el lock.
+# La imagen incluye Prefect porque la misma imagen sirve para el pipeline, el
+# servidor de Prefect y el orquestador (así las versiones coinciden siempre).
 COPY pyproject.toml uv.lock README.md ./
-RUN uv sync --frozen --no-dev --no-install-project
+RUN uv sync --frozen --no-dev --extra orchestration --no-install-project
 
 COPY src ./src
 COPY sql ./sql
-RUN uv sync --frozen --no-dev
+RUN uv sync --frozen --no-dev --extra orchestration
 
 ENTRYPOINT ["uv", "run", "--no-sync", "jobs-pipeline"]
