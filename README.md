@@ -6,8 +6,9 @@ En corto, lo que hay aquí:
 
 - Un pipeline en Python + SQL con tres capas (`raw`, `staging`, `core`) que corre completo en unos 4 minutos.
 - El modelo en [`sql/schema.sql`](sql/schema.sql) (15 tablas) y su diagrama en [`docs/erd.dbml`](docs/erd.dbml) y más abajo.
-- Validación de datos con Pandera, chequeos de calidad después de cargar, 93 tests con pytest y CI en GitHub Actions.
+- Validación de datos con Pandera, chequeos de calidad después de cargar, 97 tests con pytest y CI en GitHub Actions.
 - Postgres y el pipeline en Docker Compose; dependencias con uv.
+- Una versión orquestada con Prefect (opcional), con reintentos y su interfaz web.
 
 La sección que más me importa es la de [decisiones del modelo](#el-modelo-3fn), porque casi todas salieron de mirar los datos y no del diccionario.
 
@@ -42,6 +43,23 @@ uv run jobs-pipeline
 Sin uv también funciona con `pip install -r requirements.txt` y `python -m jobs_pipeline.pipeline`.
 
 Si el puerto 5432 ya está ocupado por otro Postgres, cambia `POSTGRES_PORT` en el `.env`.
+
+### Versión orquestada con Prefect
+
+Es el mismo pipeline, con cada paso como tarea de Prefect (detalles en [la sección de orquestación](#bonus-ci-y-orquestación)). Para verlo con la interfaz web:
+
+```bash
+docker compose --profile orchestration up -d prefect-server       # UI en http://localhost:4200
+docker compose --profile orchestration run --rm orchestrator      # una corrida
+```
+
+En http://localhost:4200, dentro de *Runs*, se ve la corrida con sus cuatro tareas, el log de cada una y cuánto tardó. Para dejarlo programado en vez de correrlo una vez:
+
+```bash
+docker compose --profile orchestration run --rm orchestrator --cron "0 6 * * *"
+```
+
+Fuera de Docker: `uv sync --all-extras` y luego `uv run jobs-flow`. Si no hay un servidor de Prefect configurado, Prefect levanta uno temporal solo para esa corrida.
 
 Para mirar el resultado:
 
@@ -396,6 +414,8 @@ Los **unitarios** (`test_extract`, `test_cleaning`, `test_validation`, `test_sta
 
 Los de **integración** (`test_integration`) corren el pipeline completo dos veces seguidas contra una base aparte (`<POSTGRES_DB>_test`) y verifican los conteos exactos de 17 tablas. Correrlo dos veces es la prueba de idempotencia. Si no hay Postgres disponible se saltan solos; en el CI corren contra un Postgres real.
 
+Los del **flow** (`test_flow`) prueban la orquestación sin base de datos: reemplazan cada paso por uno falso y verifican el orden de las tareas y, sobre todo, la política de reintentos. Un error de conexión se reintenta y el flow termina bien; un error de datos falla al primer intento; y si un paso falla, los siguientes no corren. Tardan alrededor de un minuto porque Prefect levanta un servidor temporal para la prueba. Si Prefect no está instalado, se saltan.
+
 ---
 
 ## Lo que no hice, y qué haría con más tiempo
@@ -412,7 +432,25 @@ Los de **integración** (`test_integration`) corren el pipeline completo dos vec
 
 **CI (implementado).** [`.github/workflows/ci.yml`](.github/workflows/ci.yml) corre ruff (lint y formato) y pytest en cada push y pull request. Levanta Postgres como *service container*, así que los tests de integración también corren ahí y no solo en mi máquina.
 
-**Orquestación (no implementada).** El CLI ya está partido en pasos (`--step extract|stage|core`) pensando en esto: cada paso se convertiría en una tarea. En Airflow sería un DAG `extract >> stage >> core >> quality_checks`, cada tarea llamando a la misma función de Python, con reintentos en las que tocan la base y un sensor que espere la llegada de un archivo nuevo. No lo implementé porque Airflow suma un scheduler, un webserver y su propia base de metadatos para orquestar un archivo estático que se procesa en 4 minutos, y preferí dedicarle ese tiempo al modelo y a la calidad. Para algo de este tamaño, Prefect o Dagster con un flow que envuelva `run()` alcanzarían.
+**Orquestación (implementada con Prefect).** [`flow.py`](src/jobs_pipeline/flow.py) convierte cada paso del pipeline en una tarea: `extract → stage → core → quality-checks`. Las tareas llaman exactamente a las mismas funciones que el CLI (`pipeline.extract_step`, `stage_step`, etc.), así que la lógica no está duplicada: el orquestador solo decide el orden, reintenta y registra.
+
+Hay tres decisiones de diseño que me parecen las importantes:
+
+- **Las tareas no se pasan datos entre sí.** Cada una lee de la base lo que dejó la anterior (`stage` lee `raw`, `core` lee `staging`). Así cualquier tarea se puede reintentar o correr sola sin depender de lo que haya en memoria. Mover 785 mil filas como resultado de una tarea a otra, además, sería serializar un DataFrame grande sin ninguna necesidad.
+- **Reintentar es seguro porque cada paso es idempotente.** Cada uno recarga su capa completa dentro de una transacción. Si un intento muere a la mitad, la transacción se deshace y el siguiente intento empieza limpio.
+- **Solo se reintentan los errores transitorios.** Las tareas tienen 3 reintentos, pero una función (`is_transient_error`) decide si vale la pena: solo cuando el error es de conexión (`psycopg.OperationalError`: la base se reinició o se cortó la red). Un error de datos, como un contrato de Pandera o un chequeo de calidad que falla, va a fallar igual en el segundo intento, así que reintentarlo solo demoraría el aviso. Los tests del flow verifican los dos casos.
+
+Prefect es una dependencia opcional (`uv sync --extra orchestration`): quien solo quiere correr el pipeline con `jobs-pipeline` no lo necesita, y no es poca cosa, porque con Prefect el proyecto pasa de 19 a 116 paquetes.
+
+**¿Por qué Prefect y no Airflow?** En un equipo de datos en producción, lo normal sería Airflow. Es el estándar de la industria, casi cualquier plataforma de datos ya lo tiene corriendo, y su ecosistema de operadores e integraciones no tiene comparación. Si este pipeline fuera a vivir dentro de una empresa que ya usa Airflow, lo haría como un DAG más, sin dudarlo.
+
+Para esta entrega en particular elegí Prefect por tres razones concretas:
+
+1. **Infraestructura.** Airflow 3 necesita su propia base de metadatos, un scheduler, un dag-processor y un api-server: cuatro o cinco contenedores más, y unos 4 GB de RAM para Docker. Para orquestar un archivo que se procesa en 4 minutos, eso era más infraestructura que pipeline. Prefect necesita un solo contenedor para la UI, y para correr un flow ni siquiera eso.
+2. **Dependencias.** Airflow fija cientos de versiones de librerías con su archivo de constraints, y este proyecto usa pandas 3, Pandera y psycopg 3 recientes. Instalarlo en el mismo entorno probablemente generaba conflictos, y la forma correcta de evitarlo (correr el código en un entorno aparte, con `ExternalPythonOperator` o `DockerOperator`) agregaba otra capa de complejidad. Prefect se instaló junto a todo lo demás sin cambiar ninguna versión.
+3. **La experiencia de quien revisa.** Con Prefect, probar la orquestación son dos comandos y una UI. Con Airflow son más servicios, más tiempo de arranque y más cosas que pueden fallar en una máquina que no es la mía.
+
+Pasarlo a Airflow sería directo, porque los pasos ya son funciones independientes e idempotentes. Sería un DAG `extract >> stage >> core >> quality_checks` donde cada tarea llama a la misma función, con `retries` en las tareas, y un `FileSensor` o un *dataset* para dispararlo cuando llegue un archivo nuevo en lugar de un cron fijo.
 
 ---
 
@@ -470,6 +508,7 @@ Para un dashboard de demanda de skills ("qué piden más para Data Engineer en C
 │   └── load_core.sql         carga staging -> core
 ├── src/jobs_pipeline/
 │   ├── pipeline.py           CLI y orden de los pasos
+│   ├── flow.py               el mismo pipeline como flow de Prefect
 │   ├── extract.py            CSV -> raw
 │   ├── cleaning.py           reglas de limpieza (funciones puras)
 │   ├── stage.py              raw -> staging
